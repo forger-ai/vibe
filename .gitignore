@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.env
+*.egg-info/
+backend/data/*.sqlite
+backend/data/logs/
+backend/data/workspace/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+frontend/package-lock.json
+*.local
+
+# Env files
+.env
+.env.*
+!.env.example
+.version.dev
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

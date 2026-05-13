@@ -1,0 +1,46 @@
+services:
+  backend:
+    extends:
+      file: ./commons/docker-compose.base.yml
+      service: backend
+    build:
+      context: ./backend
+      dockerfile: ../commons/backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////app/data/vibe.dev.sqlite
+      VIBE_WORKSPACE_ROOT: /app/data/workspace
+      VIBE_MANIFEST_PATH: /manifest.json
+      CORS_ORIGINS: http://localhost:5184,http://127.0.0.1:5184
+    volumes:
+      - ./backend:/app
+      - ./manifest.json:/manifest.json:ro
+      - ./backend/data:/app/data
+      - ./commons/backend/database.py:/app/src/app/database.py
+      - ./commons/backend/health.py:/app/src/app/health.py
+      - ./commons/backend/cors.py:/app/src/app/cors.py
+      - ./commons/backend/forger_desktop.py:/app/src/app/forger_desktop.py
+      - ./commons/backend/desktop_events.py:/app/src/app/desktop_events.py
+      - ./commons/backend/realtime.py:/app/src/app/realtime.py
+
+  frontend:
+    extends:
+      file: ./commons/docker-compose.base.yml
+      service: frontend
+    build:
+      context: ./frontend
+      dockerfile: ../commons/frontend/Dockerfile
+    ports:
+      - "5184:5184"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+      - ./commons/frontend/client.ts:/app/src/api/client.ts
+    depends_on:
+      - backend
+
+volumes:
+  frontend_node_modules:

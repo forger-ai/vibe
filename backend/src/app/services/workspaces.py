@@ -132,8 +132,9 @@ def create_plan_checkout(
             workspace_root(),
             repository=repository,
         )
+    _configure_plan_checkout_remote(target, repository)
     _run_git(["fetch", "--all", "--prune"], target, repository=repository)
-    _checkout_plan_ref(target, mirror, requested_ref, repository)
+    _checkout_plan_ref(target, requested_ref, repository)
     resolved_commit = _git_output(["rev-parse", "HEAD"], target, repository=repository)
     branch = (
         _git_output(["branch", "--show-current"], target, repository=repository)
@@ -184,16 +185,22 @@ def create_plan_checkout(
     return checkout
 
 
+def _configure_plan_checkout_remote(target: Path, repository: GitRepository) -> None:
+    _run_git(
+        ["remote", "set-url", "origin", repository.remote_url],
+        target,
+        repository=repository,
+    )
+
+
 def _checkout_plan_ref(
     target: Path,
-    mirror: Path,
     requested_ref: str,
     repository: GitRepository,
 ) -> None:
     local_ref = f"refs/heads/{requested_ref}"
     target_remote_ref = f"refs/remotes/origin/{requested_ref}"
-    mirror_head_ref = f"refs/heads/{requested_ref}"
-    mirror_remote_ref = f"refs/remotes/origin/{requested_ref}"
+    default_remote_ref = f"refs/remotes/origin/{repository.default_branch}"
     if _git_ref_exists(target, local_ref):
         _run_git(["checkout", requested_ref], target, repository=repository)
         return
@@ -204,26 +211,9 @@ def _checkout_plan_ref(
             repository=repository,
         )
         return
-    if _git_ref_exists(mirror, mirror_head_ref):
+    if _git_ref_exists(target, default_remote_ref):
         _run_git(
-            ["fetch", "origin", f"{mirror_head_ref}:{target_remote_ref}"],
-            target,
-            repository=repository,
-        )
-        _run_git(
-            ["checkout", "--track", f"origin/{requested_ref}"],
-            target,
-            repository=repository,
-        )
-        return
-    if _git_ref_exists(mirror, mirror_remote_ref):
-        _run_git(
-            ["fetch", "origin", f"{mirror_remote_ref}:{target_remote_ref}"],
-            target,
-            repository=repository,
-        )
-        _run_git(
-            ["checkout", "--track", f"origin/{requested_ref}"],
+            ["checkout", "-b", requested_ref, f"origin/{repository.default_branch}"],
             target,
             repository=repository,
         )

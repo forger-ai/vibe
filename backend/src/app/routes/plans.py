@@ -399,7 +399,7 @@ def complete_step_execution(
             raise ValueError("programming steps require one recorded commit for each affected repository")
         if not required_repo_ids and not commits:
             raise ValueError("programming steps require at least one recorded commit")
-    _ensure_recorded_commit_worktrees_clean(session, plan.id, commit_repo_ids)
+    _ensure_recorded_commit_checkouts_clean(session, plan.id, commit_repo_ids)
     for item in commits:
         repository_id = item.get("repository_id", "")
         commit_sha = item.get("commit_sha", "")
@@ -1309,7 +1309,7 @@ def _pending_steps_for_plan(session: Session, plan_id: str) -> list[Step]:
     return session.exec(select(Step).where(Step.plan_id == plan_id, Step.status == "pending")).all()
 
 
-def _ensure_recorded_commit_worktrees_clean(session: Session, plan_id: str, repository_ids: set[str]) -> None:
+def _ensure_recorded_commit_checkouts_clean(session: Session, plan_id: str, repository_ids: set[str]) -> None:
     if not repository_ids:
         return
     memberships = session.exec(
@@ -1333,9 +1333,9 @@ def _ensure_recorded_commit_worktrees_clean(session: Session, plan_id: str, repo
             timeout=30,
         )
         if completed.returncode != 0:
-            raise ValueError("unable to inspect plan checkout worktree")
+            raise ValueError("unable to inspect plan checkout")
         if completed.stdout.strip():
-            raise ValueError("programming steps require clean worktrees before completion")
+            raise ValueError("programming steps require clean checkouts before completion")
 
 
 def _execution_payload(execution: StepExecution) -> dict:

@@ -1,0 +1,238 @@
+name: Release App
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vibe-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read release metadata from manifest
+        id: meta
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path('manifest.json').read_text())
+          catalog = manifest.get('catalog', {})
+          release = catalog.get('release', {})
+
+          name = manifest['name']
+          version = manifest['version']
+          tag_template = release.get('tag_template', '{name}/v{version}')
+          asset_template = release.get('asset_name_template', '{name}-{version}.zip')
+
+          out = {
+            'app_name': name,
+            'app_version': version,
+            'release_repository': release.get('repository', '${{ github.repository }}'),
+            'expected_tag': tag_template.format(name=name, version=version),
+            'asset_name': asset_template.format(name=name, version=version),
+          }
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+            for k, v in out.items():
+              f.write(f'{k}={v}\n')
+          PY
+
+      - name: Validate release tag + repo
+        env:
+          EXPECTED_TAG: ${{ steps.meta.outputs.expected_tag }}
+          ACTUAL_TAG: ${{ github.event.release.tag_name }}
+          EXPECTED_REPO: ${{ steps.meta.outputs.release_repository }}
+          ACTUAL_REPO: ${{ github.repository }}
+        run: |
+          test "$EXPECTED_REPO" = "$ACTUAL_REPO" || {
+            echo "manifest expects release repo '$EXPECTED_REPO' but workflow is running in '$ACTUAL_REPO'"
+            exit 1
+          }
+          test "$EXPECTED_TAG" = "$ACTUAL_TAG" || {
+            echo "release tag mismatch: expected '$EXPECTED_TAG', got '$ACTUAL_TAG'"
+            exit 1
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Backend tests
+        working-directory: backend
+        run: |
+          uv sync --extra dev
+          uv run pytest
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Frontend build
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Build release zip
+        env:
+          ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
+        run: |
+          mkdir -p tmp/dist
+          ./scripts/package_app.sh tmp/dist "$ASSET_NAME"
+
+      - name: Compute checksums
+        id: artifact
+        env:
+          ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
+        run: |
+          ASSET_PATH="tmp/dist/$ASSET_NAME"
+          SHA256="$(shasum -a 256 "$ASSET_PATH" | awk '{print $1}')"
+          SIZE="$(wc -c < "$ASSET_PATH" | tr -d ' ')"
+          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          {
+            echo "sha256=$SHA256"
+            echo "size=$SIZE"
+            echo "published_at=$PUBLISHED_AT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload zip to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
+        run: |
+          gh release upload "$TAG" "tmp/dist/$ASSET_NAME" --clobber
+
+      - name: Publish version to FORGER Cloud
+        env:
+          PUBLISH_URL: https://platform.forger.cloud/api/v1/publisher/app_versions
+          PUBLISH_SECRET: ${{ secrets.FORGER_CATALOG_PUBLISH_SECRET }}
+          RELEASE_REPOSITORY: ${{ steps.meta.outputs.release_repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          ASSET_NAME: ${{ steps.meta.outputs.asset_name }}
+          APP_VERSION: ${{ steps.meta.outputs.app_version }}
+          ARTIFACT_SHA256: ${{ steps.artifact.outputs.sha256 }}
+          ARTIFACT_SIZE: ${{ steps.artifact.outputs.size }}
+          PUBLISHED_AT: ${{ steps.artifact.outputs.published_at }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import mimetypes
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+          from urllib import error, parse, request
+
+          secret = os.environ.get('PUBLISH_SECRET', '')
+          if not secret:
+            raise SystemExit('Missing repository secret FORGER_CATALOG_PUBLISH_SECRET.')
+
+          source_manifest = json.loads(Path('manifest.json').read_text())
+          catalog = source_manifest.get('catalog', {})
+          version = os.environ['APP_VERSION']
+          changelog_entry = next(
+            (entry for entry in source_manifest.get('changelog', []) if entry.get('version') == version),
+            {},
+          )
+          release_notes = changelog_entry.get('summary', '')
+          if changelog_entry.get('changes'):
+            release_notes = release_notes + '\n\n' + '\n'.join(
+              f"- {change}" for change in changelog_entry['changes']
+            )
+
+          app_payload = {
+            'slug': source_manifest['name'],
+            'name': catalog.get('display_name', source_manifest['name']),
+            'short_description': catalog.get('short_description', source_manifest.get('description', '')),
+            'description': catalog.get('description', source_manifest.get('description', '')),
+            'category': catalog.get('category', 'utilities'),
+            'beta': bool(catalog.get('beta', False)),
+          }
+          icon_path = catalog.get('icon_path')
+          if icon_path:
+            icon_file = Path(icon_path)
+            if not icon_file.is_file():
+              raise SystemExit(f"catalog.icon_path does not exist: {icon_path}")
+            content_type = mimetypes.guess_type(icon_file.name)[0] or 'application/octet-stream'
+            app_payload['icon'] = {
+              'filename': icon_file.name,
+              'content_type': content_type,
+              'data_base64': base64.b64encode(icon_file.read_bytes()).decode('ascii'),
+            }
+
+          payload = {
+            'app': app_payload,
+            'version': {
+              'version': version,
+              'repository': os.environ['RELEASE_REPOSITORY'],
+              'tag': os.environ['RELEASE_TAG'],
+              'asset_name': os.environ['ASSET_NAME'],
+              'runtime_stack': 'vite_fastapi_sqlite',
+              'required_python_version': source_manifest.get('stack', {}).get('backend', {}).get('python_version'),
+              'required_node_version': source_manifest.get('stack', {}).get('frontend', {}).get('node_version'),
+              'supported_platforms': catalog.get('supported_platforms', []),
+              'capabilities': catalog.get('capabilities', []),
+              'tools': source_manifest.get('tools', {}),
+              'agents': source_manifest.get('agents', []),
+              'prompt_templates': source_manifest.get('promptTemplates', []),
+              'download_url': f"https://github.com/{os.environ['RELEASE_REPOSITORY']}/releases/download/{os.environ['RELEASE_TAG']}/{os.environ['ASSET_NAME']}",
+              'checksum_sha256': os.environ['ARTIFACT_SHA256'],
+              'file_size_bytes': int(os.environ['ARTIFACT_SIZE']),
+              'published_at': os.environ['PUBLISHED_AT'],
+              'release_notes': release_notes,
+            },
+          }
+
+          body = json.dumps(payload, separators=(',', ':'), sort_keys=True).encode()
+          timestamp = subprocess.check_output(['date', '-u', '+%Y-%m-%dT%H:%M:%SZ'], text=True).strip()
+          url = os.environ['PUBLISH_URL']
+          signature_payload = b'.'.join([
+            timestamp.encode(),
+            b'POST',
+            parse.urlparse(url).path.encode(),
+            body,
+          ])
+          signature = hmac.new(secret.encode(), signature_payload, hashlib.sha256).hexdigest()
+          req = request.Request(
+            url,
+            data=body,
+            method='POST',
+            headers={
+              'Content-Type': 'application/json',
+              'User-Agent': 'ForgerCatalogPublisher/1.0',
+              'X-Forger-Timestamp': timestamp,
+              'X-Forger-Signature': f'sha256={signature}',
+            },
+          )
+          try:
+            with request.urlopen(req, timeout=30) as response:
+              sys.stdout.write(response.read().decode())
+          except error.HTTPError as exc:
+            error_body = exc.read().decode(errors='replace')
+            raise SystemExit(
+              f'Failed to publish to FORGER Cloud: HTTP {exc.code} {exc.reason}\n{error_body}'
+            ) from exc
+          except Exception as exc:
+            raise SystemExit(f'Failed to publish to FORGER Cloud: {exc}') from exc
+          PY

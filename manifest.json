@@ -1,8 +1,17 @@
 {
   "name": "vibe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local coding-agent workspace for repositories, invokable agents, orchestrated plans, discussions, notebooks, and run history.",
   "changelog": [
+    {
+      "version": "0.1.1",
+      "summary": "Improves plan checkouts and chat startup.",
+      "changes": [
+        "Makes Vibe chat reopen the latest saved conversation from local history instead of starting on a blank screen.",
+        "Improves plan checkout handling for existing and newly requested branches.",
+        "Clarifies plan completion checks around clean repository checkouts."
+      ]
+    },
     {
       "version": "0.1.0",
       "summary": "Initial Vibe app.",
@@ -53,6 +62,11 @@
       "darwin_arm64",
       "darwin_x64"
     ],
+    "release": {
+      "repository": "forger-ai/vibe",
+      "tag_template": "{name}/v{version}",
+      "asset_name_template": "{name}-{version}.zip"
+    },
     "beta": true
   },
   "agents": [

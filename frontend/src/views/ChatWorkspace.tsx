@@ -119,7 +119,7 @@ export function ChatWorkspace({
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
-  const initializedHistoryScope = useRef("");
+  const initializationRun = useRef(0);
   const processedDesktopMessages = useRef(new Set<string>());
   const persistedProgressEvents = useRef(new Set<string>());
   const activeDiscussionStarts = useRef(new Set<string>());
@@ -184,25 +184,40 @@ export function ChatWorkspace({
   }, [panelOpen, panelMode, manifestAgentId, threadId]);
 
   useEffect(() => {
-    if (initializedHistoryScope.current === historyScopeKey) return;
-    initializedHistoryScope.current = historyScopeKey;
-    let canceled = false;
+    const runId = initializationRun.current + 1;
+    initializationRun.current = runId;
+    resetChatWorkspaceState();
+    const shouldApply = () => initializationRun.current === runId;
     async function initializeChatWorkspace() {
-      const items = await loadChatHistory();
-      if (canceled) return;
-      const latestChat = items[0];
-      if (latestChat) {
-        setPanelMode("history");
+      try {
+        const items = await loadChatHistory();
+        if (!shouldApply()) return;
+        const latestChat = items[0];
+        if (latestChat) {
+          setPanelMode("history");
+          setPanelOpen(true);
+          await loadHistoricalChat(latestChat);
+          if (shouldApply()) {
+            setPanelMode("history");
+            setPanelOpen(true);
+          }
+          return;
+        }
+        setPanelMode("agents");
         setPanelOpen(true);
-        await loadHistoricalChat(latestChat);
-        return;
+      } catch (err) {
+        if (shouldApply()) {
+          setError(err instanceof Error ? err.message : "Unable to load chat history.");
+          setPanelMode("agents");
+          setPanelOpen(true);
+        }
       }
-      setPanelMode("agents");
-      setPanelOpen(true);
     }
     void initializeChatWorkspace();
     return () => {
-      canceled = true;
+      if (initializationRun.current === runId) {
+        initializationRun.current += 1;
+      }
     };
   }, [historyScopeKey]);
 
@@ -267,10 +282,18 @@ export function ChatWorkspace({
   }
 
   function newChat() {
+    resetChatWorkspaceState();
+    setPanelMode("agents");
+    setPanelOpen(true);
+    void loadChatHistory();
+  }
+
+  function resetChatWorkspaceState() {
     setThreadId(null);
     setOrchestratorThread(null);
     setAgentThreads([]);
     setLiveThreads({});
+    setMessage("");
     setMessages([]);
     setProgressEvents([]);
     setActiveDraft(null);
@@ -279,16 +302,13 @@ export function ChatWorkspace({
     setDraftMode(true);
     setDiscussions([]);
     setDiscussionDetail(null);
-    setMessage("");
+    setThoughtThreadId(null);
     setError(null);
     processedDesktopMessages.current.clear();
     persistedProgressEvents.current.clear();
     activeDiscussionStarts.current.clear();
     resumedQuestionBatches.current.clear();
     stickToBottomRef.current = true;
-    setPanelMode("agents");
-    setPanelOpen(true);
-    void loadChatHistory();
   }
 
   async function createChatRecord() {

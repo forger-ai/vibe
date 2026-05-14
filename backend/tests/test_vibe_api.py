@@ -2164,7 +2164,7 @@ def test_plan_setup_keeps_default_branch_and_script_runs_per_repo(monkeypatch, t
     assert detail["script_results"][0]["stdout"].splitlines() == ["Local script repo", "--branch|codex/example"]
 
 
-def test_plan_checkout_uses_remote_tracking_branch_from_mirror(monkeypatch, tmp_path) -> None:
+def test_plan_checkout_uses_remote_tracking_branch(monkeypatch, tmp_path) -> None:
     if not shutil.which("git"):
         pytest.skip("git is not available in the backend test container")
     workspace = tmp_path / "workspace"
@@ -2210,6 +2210,13 @@ def test_plan_checkout_uses_remote_tracking_branch_from_mirror(monkeypatch, tmp_
     assert approved.status_code == 200
     assert detail["repositories"][0]["start_ref"] == "codex/cloud-friends-messaging"
     assert subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=checkout_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == str(origin)
+    assert subprocess.run(
         ["git", "branch", "--show-current"],
         cwd=checkout_path,
         check=True,
@@ -2217,6 +2224,82 @@ def test_plan_checkout_uses_remote_tracking_branch_from_mirror(monkeypatch, tmp_
         text=True,
     ).stdout.strip() == "codex/cloud-friends-messaging"
     assert Path(checkout_path, "README.md").read_text() == "branch\n"
+
+
+def test_plan_checkout_creates_missing_branch_from_remote_default(monkeypatch, tmp_path) -> None:
+    if not shutil.which("git"):
+        pytest.skip("git is not available in the backend test container")
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("VIBE_WORKSPACE_ROOT", str(workspace))
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=origin, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=origin, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=origin, check=True)
+    (origin / "README.md").write_text("main\n")
+    subprocess.run(["git", "add", "README.md"], cwd=origin, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial"], cwd=origin, check=True)
+
+    with TestClient(app) as client:
+        repository = client.post(
+            "/api/repositories",
+            json={
+                "name": "New branch repo",
+                "remote_url": str(origin),
+                "default_branch": "main",
+            },
+        ).json()
+        plan = client.post(
+            "/api/plans",
+            json={"name": "New branch plan", "description": "Create branch."},
+        ).json()
+        client.put(
+            f"/api/plans/{plan['id']}/repositories",
+            json={
+                "repositories": [
+                    {
+                        "repository_id": repository["id"],
+                        "start_ref": "codex/new-branch",
+                    }
+                ]
+            },
+        )
+        approved = client.post(f"/api/plans/{plan['id']}/approve")
+        detail = client.get(f"/api/plans/{plan['id']}/detail").json()
+
+    checkout_path = detail["repositories"][0]["checkout_path"]
+    assert approved.status_code == 200
+    assert subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=checkout_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "codex/new-branch"
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == subprocess.run(
+        ["git", "rev-parse", "origin/main"],
+        cwd=checkout_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert subprocess.run(
+        [
+            "git",
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/codex/new-branch",
+        ],
+        cwd=checkout_path,
+        check=False,
+    ).returncode == 1
 
 
 def test_command_step_runs_multiline_command_per_repo(monkeypatch, tmp_path) -> None:
@@ -2269,6 +2352,91 @@ def test_command_step_runs_multiline_command_per_repo(monkeypatch, tmp_path) -> 
     assert detail["command_steps"][0]["command_text"] == "git branch --show-current\ncat README.md"
     assert detail["steps"][0]["status"] == "completed"
     assert detail["command_results"][0]["stdout"].splitlines() == ["main", "hello"]
+
+
+def test_command_step_pushes_plan_branch_to_repository_remote(monkeypatch, tmp_path) -> None:
+    if not shutil.which("git"):
+        pytest.skip("git is not available in the backend test container")
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("VIBE_WORKSPACE_ROOT", str(workspace))
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=origin, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=origin, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=origin, check=True)
+    (origin / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "README.md"], cwd=origin, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial"], cwd=origin, check=True)
+
+    with TestClient(app) as client:
+        repository = client.post(
+            "/api/repositories",
+            json={
+                "name": "Push command repo",
+                "remote_url": str(origin),
+                "default_branch": "main",
+            },
+        ).json()
+        plan = client.post(
+            "/api/plans",
+            json={"name": "Push command plan", "description": "Publish branch."},
+        ).json()
+        client.put(
+            f"/api/plans/{plan['id']}/repositories",
+            json={
+                "repositories": [
+                    {
+                        "repository_id": repository["id"],
+                        "start_ref": "codex/publish-branch",
+                    }
+                ]
+            },
+        )
+        client.post(f"/api/plans/{plan['id']}/approve")
+        command_type = next(
+            item
+            for item in client.get("/api/step-types").json()
+            if item["responsible"] == "command"
+        )
+        step = client.post(
+            f"/api/plans/{plan['id']}/steps",
+            json={
+                "plan_id": plan["id"],
+                "name": "Push branch",
+                "description": "Push plan branch.",
+                "step_type_id": command_type["id"],
+                "repository_ids": [repository["id"]],
+                "command_text": "\n".join(
+                    [
+                        "git config user.email test@example.com",
+                        "git config user.name 'Test User'",
+                        "printf 'published\\n' > PUBLISHED.md",
+                        "git add PUBLISHED.md",
+                        "git commit -m 'Publish branch'",
+                        "git push -u origin codex/publish-branch",
+                    ]
+                ),
+            },
+        ).json()
+        started = client.post(
+            f"/api/plans/{plan['id']}/start-steps",
+            json={"step_ids": [step["id"]]},
+        )
+        detail = _wait_for_step_status(client, plan["id"], step["id"], "completed")
+
+    mirror_path = workspace / "repos" / repository["id"]
+    assert started.status_code == 200
+    assert detail["steps"][0]["status"] == "completed"
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/codex/publish-branch"],
+        cwd=origin,
+        check=False,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/codex/publish-branch"],
+        cwd=mirror_path,
+        check=False,
+    ).returncode == 1
 
 
 def test_command_step_failure_records_error_log_and_failed_state(monkeypatch, tmp_path) -> None:

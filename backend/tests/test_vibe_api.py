@@ -18,14 +18,15 @@ from app.mcp_runtime import ToolError
 from app.mcp_server import (
     ask_user,
     call_agent,
-    create_plan_from_intake,
+    accept_chat_plan_draft,
+    create_chat_proposal,
+    create_in_chat_plan_draft,
     create_plan_step,
     create_step_assignment,
     delete_plan,
     delete_plan_step,
     delete_step_assignment,
-    draft,
-    get_active_draft,
+    get_active_chat_artifacts,
     get_notebook_entry,
     get_plan_detail,
     list_plans,
@@ -41,7 +42,7 @@ from app.mcp_server import (
     write_discussion_message,
 )
 from app.models import (
-    ChatDraft,
+    ChatPlanDraft,
     ChatThread,
     CommandExecutionResult,
     CommandStep,
@@ -396,12 +397,12 @@ def test_mcp_get_notebook_entry_by_id_or_slug() -> None:
     assert by_slug["entry"]["long_description_md"] == "The user prefers compact, actionable plans."
 
 
-def test_mcp_draft_mode_requires_orchestrator_and_batches_questions() -> None:
+def test_mcp_proposals_require_orchestrator_and_batches_questions() -> None:
     with TestClient(app) as client:
-        chat = client.post("/api/chat/threads", json={"thread_type": "free-chat-agent", "title": "Draft"}).json()
+        chat = client.post("/api/chat/threads", json={"thread_type": "free-chat-agent", "title": "Proposal"}).json()
 
-        with pytest.raises(ToolError) as forbidden_draft:
-            draft({"chat_thread_id": chat["id"], "agent_id": "agent-123", "description_md": "Plan it."})
+        with pytest.raises(ToolError) as forbidden_proposal:
+            create_chat_proposal({"chat_thread_id": chat["id"], "orchestrator_id": "agent-123", "description_md": "Plan it."})
         with pytest.raises(ToolError) as forbidden_questions:
             ask_user(
                 {
@@ -445,17 +446,17 @@ def test_mcp_draft_mode_requires_orchestrator_and_batches_questions() -> None:
                 "questions": [{"question": "Q4", "options": [{"label": "B"}]}],
             }
         )
-        created = draft({"chat_thread_id": chat["id"], "agent_id": "manifest-orchestrator", "description_md": "Implement this."})
-        state = get_active_draft({"chat_thread_id": chat["id"]})
+        created = create_chat_proposal({"chat_thread_id": chat["id"], "orchestrator_id": "manifest-orchestrator", "description_md": "Implement this."})
+        state = get_active_chat_artifacts({"chat_thread_id": chat["id"]})
 
-    assert forbidden_draft.value.code == "forbidden"
+    assert forbidden_proposal.value.code == "forbidden"
     assert forbidden_questions.value.code == "forbidden"
     assert too_many_questions.value.code == "invalid_input"
     assert too_many_options.value.code == "invalid_input"
     assert len(first["questions"]) == 4
     assert len(second["questions"]) == 1
-    assert created["draft"]["status"] == "active"
-    assert state["draft"]["id"] == created["draft"]["id"]
+    assert created["proposal"]["status"] == "active"
+    assert state["proposal"]["id"] == created["proposal"]["id"]
     assert state["questions"] == []
 
 
@@ -477,12 +478,12 @@ def test_mcp_call_agent_rejects_non_orchestrator_before_runtime() -> None:
     assert error.value.code == "forbidden"
 
 
-def test_mcp_orchestration_rejects_active_draft_gate_before_runtime() -> None:
+def test_mcp_orchestration_rejects_active_chat_artifact_before_runtime() -> None:
     with TestClient(app) as client:
         chat = client.post("/api/chat/threads", json={"thread_type": "free-chat-agent", "title": "Gate"}).json()
         agents = client.get("/api/agents").json()[:2]
         agent = agents[0]
-        draft({"chat_thread_id": chat["id"], "agent_id": "manifest-orchestrator", "description_md": "Review this first."})
+        create_chat_proposal({"chat_thread_id": chat["id"], "orchestrator_id": "manifest-orchestrator", "description_md": "Review this first."})
 
     with pytest.raises(ToolError) as call_error:
         call_agent(
@@ -503,8 +504,8 @@ def test_mcp_orchestration_rejects_active_draft_gate_before_runtime() -> None:
             }
         )
 
-    assert call_error.value.code == "draft_gate_active"
-    assert discussion_error.value.code == "draft_gate_active"
+    assert call_error.value.code == "chat_artifact_active"
+    assert discussion_error.value.code == "chat_artifact_active"
 
 
 def test_chat_agent_thread_can_exist_before_agent_thread() -> None:
@@ -818,7 +819,7 @@ def test_chat_debug_events_are_written_to_file(monkeypatch, tmp_path) -> None:
     assert '"messageLength": 12' in content
 
 
-def test_create_plan_from_intake_uses_orchestrator_authority() -> None:
+def test_create_in_chat_plan_draft_uses_orchestrator_authority() -> None:
     with TestClient(app) as client:
         agents = client.get("/api/agents").json()[:2]
         programming_type_id = _step_type_id(client, "Programming")
@@ -831,19 +832,11 @@ def test_create_plan_from_intake_uses_orchestrator_authority() -> None:
             f"/api/chat/threads/{chat['id']}/agents/{agents[1]['id']}",
             json={"agent_id": agents[1]["id"], "enabled": True},
         )
-        created_draft = draft(
+        result = create_in_chat_plan_draft(
             {
                 "chat_thread_id": chat["id"],
-                "agent_id": "manifest-orchestrator",
-                "description_md": "Plan the work.",
-            }
-        )
-        client.patch(f"/api/chat/drafts/{created_draft['draft']['id']}", json={"status": "accepted"})
-        result = create_plan_from_intake(
-            {
-                "chat_thread_id": chat["id"],
-                "agent_id": "manifest-orchestrator",
-                "name": "Draft plan",
+                "orchestrator_id": "featureIntakeOrchestrator",
+                "name": "Plan proposal",
                 "description": "Plan the work.",
                 "steps": [
                     {
@@ -859,13 +852,13 @@ def test_create_plan_from_intake_uses_orchestrator_authority() -> None:
         )
 
     assert result["success"] is True
-    assert result["plan_id"]
-    assert result["chat_thread_id"]
-    assert len(result["step_ids"]) == 1
-    assert get_active_draft({"chat_thread_id": chat["id"]})["draft"] is None
+    assert result["plan_draft"]["status"] == "active"
+    assert result["plan_draft"]["orchestrator_id"] == "featureIntakeOrchestrator"
+    assert len(result["plan_draft"]["steps_json"]) == 1
+    assert get_active_chat_artifacts({"chat_thread_id": chat["id"]})["plan_draft"]["id"] == result["plan_draft"]["id"]
 
 
-def test_create_plan_from_intake_rolls_back_invalid_command_step() -> None:
+def test_create_in_chat_plan_draft_rolls_back_invalid_command_step() -> None:
     with TestClient(app) as client:
         command_type = _step_type_by_responsible(client, "command")
         chat = client.post(
@@ -880,24 +873,13 @@ def test_create_plan_from_intake_rolls_back_invalid_command_step() -> None:
                 "default_branch": "main",
             },
         ).json()
-        created_draft = draft(
-            {
-                "chat_thread_id": chat["id"],
-                "agent_id": "manifest-orchestrator",
-                "description_md": "Plan the work.",
-            }
-        )
-        client.patch(
-            f"/api/chat/drafts/{created_draft['draft']['id']}",
-            json={"status": "accepted"},
-        )
         before_counts = _plan_creation_counts()
 
         with pytest.raises(ToolError) as error:
-            create_plan_from_intake(
+            create_in_chat_plan_draft(
                 {
                     "chat_thread_id": chat["id"],
-                    "agent_id": "manifest-orchestrator",
+                    "orchestrator_id": "featureIntakeOrchestrator",
                     "name": "Atomic invalid plan",
                     "description": "Should not persist.",
                     "repositories": [
@@ -914,16 +896,14 @@ def test_create_plan_from_intake_rolls_back_invalid_command_step() -> None:
                 }
             )
         after_counts = _plan_creation_counts()
-        active_draft = get_active_draft({"chat_thread_id": chat["id"]})["draft"]
 
     assert error.value.code == "invalid_input"
     assert str(error.value) == "command steps require a command"
     assert after_counts == before_counts
-    assert active_draft["id"] == created_draft["draft"]["id"]
-    assert active_draft["status"] == "accepted"
+    assert get_active_chat_artifacts({"chat_thread_id": chat["id"]})["plan_draft"] is None
 
 
-def test_create_plan_from_intake_creates_command_step_atomically() -> None:
+def test_accept_chat_plan_draft_creates_command_step_atomically() -> None:
     with TestClient(app) as client:
         command_type = _step_type_by_responsible(client, "command")
         chat = client.post(
@@ -938,21 +918,10 @@ def test_create_plan_from_intake_creates_command_step_atomically() -> None:
                 "default_branch": "main",
             },
         ).json()
-        created_draft = draft(
+        draft_result = create_in_chat_plan_draft(
             {
                 "chat_thread_id": chat["id"],
-                "agent_id": "manifest-orchestrator",
-                "description_md": "Plan the work.",
-            }
-        )
-        client.patch(
-            f"/api/chat/drafts/{created_draft['draft']['id']}",
-            json={"status": "accepted"},
-        )
-        result = create_plan_from_intake(
-            {
-                "chat_thread_id": chat["id"],
-                "agent_id": "manifest-orchestrator",
+                "orchestrator_id": "featureIntakeOrchestrator",
                 "name": "Atomic command plan",
                 "description": "Persist a valid command step.",
                 "repositories": [
@@ -969,55 +938,43 @@ def test_create_plan_from_intake_creates_command_step_atomically() -> None:
                 ],
             }
         )
+        result = accept_chat_plan_draft(
+            {
+                "chat_plan_draft_id": draft_result["plan_draft"]["id"],
+                "orchestrator_id": "featureIntakeOrchestrator",
+            }
+        )
         detail = get_plan_detail({"plan_id": result["plan_id"]})
-        active_draft = get_active_draft({"chat_thread_id": chat["id"]})["draft"]
+        active_artifacts = get_active_chat_artifacts({"chat_thread_id": chat["id"]})
         with Session(engine) as session:
-            draft_record = session.get(ChatDraft, created_draft["draft"]["id"])
+            draft_record = session.get(ChatPlanDraft, draft_result["plan_draft"]["id"])
 
     assert result["success"] is True
     assert len(result["step_ids"]) == 1
     assert detail["command_steps"][0]["command_text"] == "git status --short"
-    assert active_draft is None
+    assert active_artifacts["plan_draft"] is None
     assert draft_record is not None
     assert draft_record.status == "implemented"
+    assert draft_record.created_plan_id == result["plan_id"]
 
 
-def test_create_plan_from_intake_requires_manifest_orchestrator_and_accepted_draft() -> None:
+def test_create_in_chat_plan_draft_rejects_coworker_authority() -> None:
     with TestClient(app) as client:
         agent = client.get("/api/agents").json()[0]
         programming_type_id = _step_type_id(client, "Programming")
         chat = client.post("/api/chat/threads", json={"thread_type": "featureIntakeOrchestrator", "title": "Build"}).json()
 
-        with pytest.raises(ToolError) as missing_draft:
-            create_plan_from_intake(
-                {
-                    "chat_thread_id": chat["id"],
-                    "agent_id": "manifest-orchestrator",
-                    "name": "Draft plan",
-                    "description": "Plan the work.",
-                    "steps": [{"name": "Build", "description": "Do work.", "step_type_id": programming_type_id}],
-                }
-            )
-        created_draft = draft(
-            {
-                "chat_thread_id": chat["id"],
-                "agent_id": "manifest-orchestrator",
-                "description_md": "Plan the work.",
-            }
-        )
-        client.patch(f"/api/chat/drafts/{created_draft['draft']['id']}", json={"status": "accepted"})
         with pytest.raises(ToolError) as wrong_agent:
-            create_plan_from_intake(
+            create_in_chat_plan_draft(
                 {
                     "chat_thread_id": chat["id"],
-                    "agent_id": agent["id"],
-                    "name": "Draft plan",
+                    "orchestrator_id": agent["id"],
+                    "name": "Plan proposal",
                     "description": "Plan the work.",
                     "steps": [{"name": "Build", "description": "Do work.", "step_type_id": programming_type_id}],
                 }
             )
 
-    assert missing_draft.value.code == "draft_not_accepted"
     assert wrong_agent.value.code == "forbidden"
 
 
@@ -1030,10 +987,10 @@ def test_mcp_plan_creation_requires_step_type_and_rejects_kind() -> None:
             json={"agent_id": agent["id"], "enabled": True},
         )
         try:
-            create_plan_from_intake(
+            create_in_chat_plan_draft(
                 {
                     "chat_thread_id": chat["id"],
-                    "agent_id": agent["id"],
+                    "orchestrator_id": "featureIntakeOrchestrator",
                     "name": "Missing type",
                     "description": "Plan the work.",
                     "steps": [{"name": "Build", "description": "Do work."}],
@@ -1043,10 +1000,10 @@ def test_mcp_plan_creation_requires_step_type_and_rejects_kind() -> None:
         except ToolError:
             missing_type_denied = True
         try:
-            create_plan_from_intake(
+            create_in_chat_plan_draft(
                 {
                     "chat_thread_id": chat["id"],
-                    "agent_id": agent["id"],
+                    "orchestrator_id": "featureIntakeOrchestrator",
                     "name": "Legacy kind",
                     "description": "Plan the work.",
                     "steps": [

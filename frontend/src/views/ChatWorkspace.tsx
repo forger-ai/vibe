@@ -24,13 +24,15 @@ import remarkGfm from "remark-gfm";
 import type {
   Agent,
   AgentThread,
-  ChatDraft,
-  ChatDraftQuestion,
   ChatMessage,
+  ChatPlanDraft,
   ChatProgressEvent,
+  ChatProposal,
+  ChatQuestion,
   ChatThread,
   Discussion,
   DiscussionDetail,
+  Plan,
 } from "../api/types";
 import { api } from "../api/vibe";
 import { SectionHeader } from "../components/SectionHeader";
@@ -85,6 +87,7 @@ export function ChatWorkspace({
   historyDescription,
   disabledInput,
   onChanged,
+  onPlanCreated,
 }: {
   title: string;
   subtitle: string;
@@ -96,6 +99,7 @@ export function ChatWorkspace({
   historyDescription?: string;
   disabledInput?: boolean;
   onChanged: () => void;
+  onPlanCreated?: (plan: Plan) => void;
 }) {
   const enabledAgents = useMemo(() => agents.filter((agent) => agent.enabled), [agents]);
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([]);
@@ -106,10 +110,12 @@ export function ChatWorkspace({
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [progressEvents, setProgressEvents] = useState<ChatProgressEvent[]>([]);
-  const [activeDraft, setActiveDraft] = useState<ChatDraft | null>(null);
-  const [draftQuestions, setDraftQuestions] = useState<ChatDraftQuestion[]>([]);
-  const [draftQuestionIndex, setDraftQuestionIndex] = useState(0);
-  const [draftMode, setDraftMode] = useState(true);
+  const [activeProposal, setActiveProposal] = useState<ChatProposal | null>(null);
+  const [activePlanDraft, setActivePlanDraft] = useState<ChatPlanDraft | null>(null);
+  const [chatQuestions, setChatQuestions] = useState<ChatQuestion[]>([]);
+  const [chatQuestionIndex, setChatQuestionIndex] = useState(0);
+  const [proposalFeedback, setProposalFeedback] = useState("");
+  const [planDraftFeedback, setPlanDraftFeedback] = useState("");
   const [discussions, setDiscussions] = useState<Discussion[]>([]);
   const [discussionDetail, setDiscussionDetail] = useState<DiscussionDetail | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
@@ -151,18 +157,19 @@ export function ChatWorkspace({
     let canceled = false;
     async function poll() {
       if (!threadId || canceled) return;
-      const [nextMessages, nextProgress, nextThreads, nextDiscussions, nextDraftState] = await Promise.all([
+      const [nextMessages, nextProgress, nextThreads, nextDiscussions, nextArtifactState] = await Promise.all([
         api.chatMessages(threadId),
         api.chatProgress(threadId),
         api.agentThreads(),
         api.discussions(threadId),
-        api.activeDraft(threadId).catch(() => ({ draft: null, questions: [] })),
+        api.activeChatArtifacts(threadId).catch(() => ({ proposal: null, plan_draft: null, questions: [] })),
       ]);
       const relevantThreads = nextThreads.filter((item) => item.chat_thread_id === threadId);
       setMessages(nextMessages.filter((item) => item.visibility === "visible"));
       setProgressEvents(nextProgress);
-      setActiveDraft(nextDraftState.draft ?? null);
-      setDraftQuestions(nextDraftState.questions ?? []);
+      setActiveProposal(nextArtifactState.proposal ?? null);
+      setActivePlanDraft(nextArtifactState.plan_draft ?? null);
+      setChatQuestions(nextArtifactState.questions ?? []);
       setAgentThreads(relevantThreads);
       setDiscussions(nextDiscussions);
       const nextOrchestrator = relevantThreads.find((item) => item.owner_type === "orchestrator") ?? orchestratorThread;
@@ -221,15 +228,15 @@ export function ChatWorkspace({
     };
   }, [historyScopeKey]);
 
-  const pendingDraftQuestions = draftQuestions.filter((question) => question.status === "pending");
-  const currentDraftQuestion = pendingDraftQuestions[Math.min(draftQuestionIndex, Math.max(0, pendingDraftQuestions.length - 1))];
-  const activeGatePending = Boolean(currentDraftQuestion || activeDraft?.status === "active");
+  const pendingChatQuestions = chatQuestions.filter((question) => question.status === "pending");
+  const currentChatQuestion = pendingChatQuestions[Math.min(chatQuestionIndex, Math.max(0, pendingChatQuestions.length - 1))];
+  const activeGatePending = Boolean(currentChatQuestion || activeProposal?.status === "active" || activePlanDraft?.status === "active");
   const singleAgentThreads = agentThreads.filter((item) => item.owner_type === "agent" && item.invocation_mode === "single_task");
 
   useEffect(() => {
     if (!stickToBottomRef.current || !scrollRef.current) return;
     scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages.length, pendingDraftQuestions.length, activeDraft?.id, activeDraft?.description_md]);
+  }, [messages.length, pendingChatQuestions.length, activeProposal?.id, activeProposal?.description_md, activePlanDraft?.id]);
 
   const thoughtThread = thoughtThreadId ? liveThreads[thoughtThreadId] : undefined;
   const thoughtStoredThread = thoughtThreadId ? agentThreads.find((item) => item.id === thoughtThreadId) : undefined;
@@ -296,10 +303,12 @@ export function ChatWorkspace({
     setMessage("");
     setMessages([]);
     setProgressEvents([]);
-    setActiveDraft(null);
-    setDraftQuestions([]);
-    setDraftQuestionIndex(0);
-    setDraftMode(true);
+    setActiveProposal(null);
+    setActivePlanDraft(null);
+    setChatQuestions([]);
+    setChatQuestionIndex(0);
+    setProposalFeedback("");
+    setPlanDraftFeedback("");
     setDiscussions([]);
     setDiscussionDetail(null);
     setThoughtThreadId(null);
@@ -570,13 +579,13 @@ export function ChatWorkspace({
 
   async function loadHistoricalChat(item: ChatHistoryItem) {
     setError(null);
-    const [threadMessages, threadParticipants, storedThreads, nextProgress, nextDiscussions, nextDraftState] = await Promise.all([
+    const [threadMessages, threadParticipants, storedThreads, nextProgress, nextDiscussions, nextArtifactState] = await Promise.all([
       api.chatMessages(item.thread.id),
       api.chatAgents(item.thread.id),
       api.agentThreads(),
       api.chatProgress(item.thread.id),
       api.discussions(item.thread.id),
-      api.activeDraft(item.thread.id).catch(() => ({ draft: null, questions: [] })),
+      api.activeChatArtifacts(item.thread.id).catch(() => ({ proposal: null, plan_draft: null, questions: [] })),
     ]);
     processedDesktopMessages.current.clear();
     persistedProgressEvents.current.clear();
@@ -586,9 +595,10 @@ export function ChatWorkspace({
     setThreadId(item.thread.id);
     setMessages(threadMessages.filter((message) => message.visibility === "visible"));
     setProgressEvents(nextProgress);
-    setActiveDraft(nextDraftState.draft ?? null);
-    setDraftQuestions(nextDraftState.questions ?? []);
-    setDraftQuestionIndex(0);
+    setActiveProposal(nextArtifactState.proposal ?? null);
+    setActivePlanDraft(nextArtifactState.plan_draft ?? null);
+    setChatQuestions(nextArtifactState.questions ?? []);
+    setChatQuestionIndex(0);
     setSelectedAgentIds(threadParticipants.filter((participant) => participant.enabled).map((participant) => participant.agent_id));
     setAgentThreads(relevantThreads);
     setDiscussions(nextDiscussions);
@@ -638,19 +648,20 @@ export function ChatWorkspace({
     await refreshLiveThread(storedThread.desktop_thread_id);
   }
 
-  async function answerCurrentDraftQuestion(optionLabel: string) {
-    const question = pendingDraftQuestions[draftQuestionIndex];
+  async function answerCurrentChatQuestion(optionLabel: string) {
+    const question = pendingChatQuestions[chatQuestionIndex];
     if (!question || !threadId || !orchestratorThread) return;
-    await api.answerDraftQuestion(question.id, { selected_option: optionLabel, answer_text: optionLabel });
-    const nextQuestions = draftQuestions.map((item) =>
+    await api.answerChatQuestion(question.id, { selected_option: optionLabel, answer_text: optionLabel });
+    const nextQuestions = chatQuestions.map((item) =>
       item.id === question.id
         ? { ...item, selected_option: optionLabel, answer_text: optionLabel, status: "answered" }
         : item,
     );
-    const nextState = await api.activeDraft(question.chat_thread_id);
-    setDraftQuestions(nextState.questions ?? []);
-    setActiveDraft(nextState.draft ?? null);
-    setDraftQuestionIndex((current) => Math.min(current + 1, Math.max(0, pendingDraftQuestions.length - 2)));
+    const nextState = await api.activeChatArtifacts(question.chat_thread_id);
+    setChatQuestions(nextState.questions ?? []);
+    setActiveProposal(nextState.proposal ?? null);
+    setActivePlanDraft(nextState.plan_draft ?? null);
+    setChatQuestionIndex((current) => Math.min(current + 1, Math.max(0, pendingChatQuestions.length - 2)));
     const batchQuestions = nextQuestions.filter((item) => item.batch_id === question.batch_id);
     const batchComplete = batchQuestions.length > 0 && batchQuestions.every((item) => item.status === "answered");
     if (batchComplete && !resumedQuestionBatches.current.has(question.batch_id)) {
@@ -660,38 +671,63 @@ export function ChatWorkspace({
         selected_option: item.selected_option,
         answer_text: item.answer_text,
       }));
-      const text = `The user answered the pending Draft Mode questions:\n\n${answers
+      const text = `The user answered the pending chat questions:\n\n${answers
         .map((item, index) => `${index + 1}. ${item.question}\nAnswer: ${item.answer_text || item.selected_option || ""}`)
         .join("\n\n")}`;
       await sendToThread(
         orchestratorThread,
         text,
-        "draft_questions_answered",
+        "chat_questions_answered",
         question.batch_id,
         await buildResumeVariables(threadId, text),
       );
     }
   }
 
-  async function acceptDraft() {
-    if (!activeDraft || !threadId || !orchestratorThread) return;
-    const updated = await api.updateDraft(activeDraft.id, { status: "accepted" });
-    setActiveDraft(updated);
-    setDraftMode(false);
-    const text = `The user accepted the active draft.\n\ndraft_id: ${updated.id}\n\n${updated.description_md}`;
-    await sendToThread(orchestratorThread, text, "draft_accepted", updated.id, await buildResumeVariables(threadId, text));
+  async function acceptProposal() {
+    if (!activeProposal) return;
+    const updated = await api.updateChatProposal(activeProposal.id, { status: "accepted" });
+    setActiveProposal(updated.status === "active" ? updated : null);
+    setProposalFeedback("");
   }
 
-  async function requestDraftChanges() {
-    if (!activeDraft || !threadId || !orchestratorThread) return;
-    const updated = await api.updateDraft(activeDraft.id, { status: "changes_requested" });
-    setActiveDraft(updated);
-    const text = `The user requested changes to the active draft.\n\ndraft_id: ${activeDraft.id}\n\nCurrent draft:\n${activeDraft.description_md}`;
+  async function requestProposalChanges() {
+    const feedback = proposalFeedback.trim();
+    if (!activeProposal || !threadId || !orchestratorThread || !feedback) return;
+    await api.updateChatProposal(activeProposal.id, { status: "changes_requested" });
+    setActiveProposal(null);
+    setProposalFeedback("");
+    const text = `The user asked for changes to the proposal.\n\nproposal_id: ${activeProposal.id}\n\nFeedback:\n${feedback}\n\nProposal:\n${activeProposal.description_md}`;
     await sendToThread(
       orchestratorThread,
       text,
-      "draft_changes_requested",
-      activeDraft.id,
+      "proposal_changes_requested",
+      activeProposal.id,
+      await buildResumeVariables(threadId, text),
+    );
+  }
+
+  async function acceptPlanDraft() {
+    if (!activePlanDraft) return;
+    const result = await api.acceptChatPlanDraft(activePlanDraft.id);
+    setActivePlanDraft(null);
+    setPlanDraftFeedback("");
+    onPlanCreated?.(result.plan);
+    onChanged();
+  }
+
+  async function requestPlanDraftChanges() {
+    const feedback = planDraftFeedback.trim();
+    if (!activePlanDraft || !threadId || !orchestratorThread || !feedback) return;
+    await api.updateChatPlanDraft(activePlanDraft.id, { status: "changes_requested" });
+    setActivePlanDraft(null);
+    setPlanDraftFeedback("");
+    const text = `The user asked for changes to the plan proposal.\n\nplan_draft_id: ${activePlanDraft.id}\n\nFeedback:\n${feedback}\n\nPlan proposal:\n${activePlanDraft.name}\n\n${activePlanDraft.description}\n\n${activePlanDraft.context_md}`;
+    await sendToThread(
+      orchestratorThread,
+      text,
+      "plan_draft_changes_requested",
+      activePlanDraft.id,
       await buildResumeVariables(threadId, text),
     );
   }
@@ -709,7 +745,6 @@ export function ChatWorkspace({
         "You are the manifest-defined Vibe orchestrator for this chat.",
         "The database Agent records are invokable coworkers only.",
         "Use MCP reads before claiming Vibe state.",
-        `draft_mode: ${draftMode ? "active" : "inactive"}`,
       ].join("\n"),
       agentsInChat: describeSelectedAgents(),
       planDescription: typeof plan.description === "string" ? plan.description : "",
@@ -730,7 +765,6 @@ export function ChatWorkspace({
         "You are the manifest-defined Vibe orchestrator for this chat.",
         "The database Agent records are invokable coworkers only.",
         "Use MCP reads before claiming Vibe state.",
-        `draft_mode: ${draftMode ? "active" : "inactive"}`,
       ].join("\n"),
       turnPayload: {
         chat_thread_id: chatThreadId,
@@ -1008,26 +1042,26 @@ export function ChatWorkspace({
                   </Stack>
                 </Paper>
               )}
-              {currentDraftQuestion && (
+              {currentChatQuestion && (
                 <Paper variant="outlined" sx={{ p: 1.25, borderRadius: 1, bgcolor: "background.paper" }}>
                   <Stack spacing={1}>
                     <Stack direction="row" justifyContent="space-between" alignItems="center">
-                      <Typography fontWeight={850}>{currentDraftQuestion.question}</Typography>
+                      <Typography fontWeight={850}>{currentChatQuestion.question}</Typography>
                       <Stack direction="row" spacing={0.5} alignItems="center">
-                        <IconButton size="small" disabled={draftQuestionIndex <= 0} onClick={() => setDraftQuestionIndex((current) => Math.max(0, current - 1))}>
+                        <IconButton size="small" disabled={chatQuestionIndex <= 0} onClick={() => setChatQuestionIndex((current) => Math.max(0, current - 1))}>
                           <ArrowBackIosNew fontSize="inherit" />
                         </IconButton>
                         <Typography variant="caption" color="text.secondary">
-                          {Math.min(draftQuestionIndex + 1, pendingDraftQuestions.length)} of {pendingDraftQuestions.length}
+                          {Math.min(chatQuestionIndex + 1, pendingChatQuestions.length)} of {pendingChatQuestions.length}
                         </Typography>
-                        <IconButton size="small" disabled={draftQuestionIndex >= pendingDraftQuestions.length - 1} onClick={() => setDraftQuestionIndex((current) => Math.min(pendingDraftQuestions.length - 1, current + 1))}>
+                        <IconButton size="small" disabled={chatQuestionIndex >= pendingChatQuestions.length - 1} onClick={() => setChatQuestionIndex((current) => Math.min(pendingChatQuestions.length - 1, current + 1))}>
                           <ArrowForwardIos fontSize="inherit" />
                         </IconButton>
                       </Stack>
                     </Stack>
                     <Stack spacing={0.75}>
-                      {currentDraftQuestion.options_json.map((option, index) => (
-                        <Button key={`${currentDraftQuestion.id}-${option.label}`} variant={index === 0 ? "contained" : "outlined"} onClick={() => void answerCurrentDraftQuestion(option.label)} sx={{ justifyContent: "flex-start", textAlign: "left" }}>
+                      {currentChatQuestion.options_json.map((option, index) => (
+                        <Button key={`${currentChatQuestion.id}-${option.label}`} variant={index === 0 ? "contained" : "outlined"} onClick={() => void answerCurrentChatQuestion(option.label)} sx={{ justifyContent: "flex-start", textAlign: "left" }}>
                           {index + 1}. {option.label}{option.description ? ` - ${option.description}` : ""}
                         </Button>
                       ))}
@@ -1035,16 +1069,47 @@ export function ChatWorkspace({
                   </Stack>
                 </Paper>
               )}
-              {activeDraft && activeDraft.status === "active" && (
+              {activeProposal && activeProposal.status === "active" && (
                 <Paper variant="outlined" sx={{ p: 1.25, borderRadius: 1, bgcolor: "background.paper" }}>
                   <Stack spacing={1}>
-                    <Typography variant="caption" color="text.secondary">Draft</Typography>
+                    <Typography variant="caption" color="text.secondary">Proposal</Typography>
                     <Box sx={{ maxHeight: { xs: 260, md: 360 }, overflowY: "auto", pr: 0.5 }}>
-                      <MarkdownContent content={activeDraft.description_md} />
+                      <MarkdownContent content={activeProposal.description_md} />
                     </Box>
+                    <TextField
+                      size="small"
+                      multiline
+                      minRows={2}
+                      value={proposalFeedback}
+                      placeholder="No, and tell me what to do differently"
+                      onChange={(event) => setProposalFeedback(event.target.value)}
+                    />
                     <Stack direction="row" spacing={1} justifyContent="flex-end">
-                      <Button size="small" startIcon={<Close />} onClick={() => void requestDraftChanges()}>Request changes</Button>
-                      <Button size="small" variant="contained" startIcon={<CheckCircle />} onClick={() => void acceptDraft()}>Accept draft</Button>
+                      <Button size="small" startIcon={<Close />} disabled={!proposalFeedback.trim()} onClick={() => void requestProposalChanges()}>Send feedback</Button>
+                      <Button size="small" variant="contained" startIcon={<CheckCircle />} onClick={() => void acceptProposal()}>Seems fine</Button>
+                    </Stack>
+                  </Stack>
+                </Paper>
+              )}
+              {activePlanDraft && activePlanDraft.status === "active" && (
+                <Paper variant="outlined" sx={{ p: 1.25, borderRadius: 1, bgcolor: "background.paper" }}>
+                  <Stack spacing={1}>
+                    <Typography variant="caption" color="text.secondary">Plan proposal</Typography>
+                    <Typography fontWeight={850}>{activePlanDraft.name}</Typography>
+                    <Box sx={{ maxHeight: { xs: 260, md: 360 }, overflowY: "auto", pr: 0.5 }}>
+                      <MarkdownContent content={`${activePlanDraft.description}\n\n${activePlanDraft.context_md}\n\n${activePlanDraft.steps_json.map((step, index) => `${index + 1}. ${String(step.name ?? "Step")}: ${String(step.description ?? "")}`).join("\n")}`} />
+                    </Box>
+                    <TextField
+                      size="small"
+                      multiline
+                      minRows={2}
+                      value={planDraftFeedback}
+                      placeholder="Tell me what to do differently"
+                      onChange={(event) => setPlanDraftFeedback(event.target.value)}
+                    />
+                    <Stack direction="row" spacing={1} justifyContent="flex-end">
+                      <Button size="small" startIcon={<Close />} disabled={!planDraftFeedback.trim()} onClick={() => void requestPlanDraftChanges()}>Send feedback</Button>
+                      <Button size="small" variant="contained" startIcon={<CheckCircle />} onClick={() => void acceptPlanDraft()}>Accept</Button>
                     </Stack>
                   </Stack>
                 </Paper>
@@ -1052,12 +1117,7 @@ export function ChatWorkspace({
             </Stack>
           </Paper>
           <Stack spacing={1}>
-            <TextField value={message} fullWidth multiline maxRows={5} placeholder={activeGatePending ? "Answer the pending draft item to continue..." : "Message the orchestrator..."} disabled={disabledInput || activeGatePending} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => {
-              if (event.key === "Tab" && event.shiftKey) {
-                event.preventDefault();
-                setDraftMode((current) => !current);
-                return;
-              }
+            <TextField value={message} fullWidth multiline maxRows={5} placeholder={activeGatePending ? "Answer the pending item to continue..." : "Message the orchestrator..."} disabled={disabledInput || activeGatePending} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 void send();
@@ -1066,9 +1126,6 @@ export function ChatWorkspace({
             <Stack direction="row" justifyContent="space-between" alignItems="center">
               <Stack direction="row" spacing={1} alignItems="center">
                 <Button size="small" startIcon={<AddComment />} onClick={newChat}>New chat</Button>
-                <Button size="small" variant={draftMode ? "contained" : "outlined"} onClick={() => setDraftMode((current) => !current)}>
-                  Draft Mode {draftMode ? "on" : "off"}
-                </Button>
               </Stack>
               <Button size="small" variant="contained" endIcon={<Send />} disabled={disabledInput || activeGatePending || !message.trim()} onClick={() => void send()} sx={{ minWidth: 96 }}>Send</Button>
             </Stack>

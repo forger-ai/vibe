@@ -21,8 +21,9 @@ from app.models import (
     AgentRun,
     AgentThread,
     ChatAgentThread,
-    ChatDraft,
-    ChatDraftQuestion,
+    ChatPlanDraft,
+    ChatProposal,
+    ChatQuestion,
     ChatMessage,
     ChatProgressEvent,
     ChatThread,
@@ -53,6 +54,11 @@ from app.models import (
     utcnow,
 )
 from app.services.plan_deletion import delete_plan_cascade
+from app.services.plan_drafts import (
+    PlanDraftError,
+    create_plan_from_chat_plan_draft,
+    validate_plan_draft_payload,
+)
 from app.services.prompt_builder import list_thread_interfaces, notebook_slug, render_agent_prompt
 from app.services.scripts import (
     delete_script_files,
@@ -306,7 +312,7 @@ def call_agent(args: dict[str, Any]) -> dict[str, Any]:
 
     with Session(engine) as session:
         _require_manifest_orchestrator(session, thread_id, orchestrator_agent_id)
-        _require_no_blocking_draft_gate(session, thread_id)
+        _require_no_blocking_chat_artifact(session, thread_id)
         agent = session.get(Agent, agent_id)
         if not agent:
             raise ToolError("agent_id not found", code="not_found")
@@ -419,14 +425,13 @@ def call_agent(args: dict[str, Any]) -> dict[str, Any]:
 
 @registry.tool(
     "ask_user",
-    "Ask the user up to four Draft Mode questions. Only the manifest orchestrator may call this tool.",
+    "Ask the user up to four chat questions. Only the manifest orchestrator may call this tool.",
     {
         "type": "object",
         "properties": {
             "chat_thread_id": {"type": "string"},
             "agent_id": {"type": "string"},
             "orchestrator_agent_id": {"type": "string"},
-            "chat_draft_id": {"type": "string"},
             "questions": {
                 "type": "array",
                 "items": {
@@ -467,11 +472,8 @@ def ask_user(args: dict[str, Any]) -> dict[str, Any]:
     batch_id = str(uuid4())
     with Session(engine) as session:
         _require_manifest_orchestrator(session, thread_id, orchestrator_agent_id)
-        _cancel_active_draft_gates(session, thread_id)
-        draft_id = str(args.get("chat_draft_id") or "") or None
-        if draft_id and not session.get(ChatDraft, draft_id):
-            raise ToolError("chat_draft_id not found", code="not_found")
-        created: list[ChatDraftQuestion] = []
+        _cancel_active_chat_artifacts(session, thread_id)
+        created: list[ChatQuestion] = []
         for position, item in enumerate(questions):
             question = str(item.get("question") or "").strip() if isinstance(item, dict) else ""
             options = item.get("options") if isinstance(item, dict) else []
@@ -490,9 +492,8 @@ def ask_user(args: dict[str, Any]) -> dict[str, Any]:
             if len(normalized_options) != len(options):
                 raise ToolError("each option requires a label", code="invalid_input")
             created.append(
-                ChatDraftQuestion(
+                ChatQuestion(
                     chat_thread_id=thread_id,
-                    chat_draft_id=draft_id,
                     question=question,
                     options_json=normalized_options,
                     batch_id=batch_id,
@@ -506,38 +507,37 @@ def ask_user(args: dict[str, Any]) -> dict[str, Any]:
         return {
             "success": True,
             "batch_id": batch_id,
-            "questions": [_draft_question_payload(question) for question in created],
+            "questions": [_chat_question_payload(question) for question in created],
         }
 
 
 @registry.tool(
-    "draft",
-    "Create or replace the active Draft Mode draft. Only the manifest orchestrator may call this tool.",
+    "create_chat_proposal",
+    "Create or replace the active chat proposal. Only the manifest orchestrator may call this tool.",
     {
         "type": "object",
         "properties": {
             "chat_thread_id": {"type": "string"},
-            "agent_id": {"type": "string"},
             "orchestrator_agent_id": {"type": "string"},
-            "manifest_orchestrator_id": {"type": "string"},
+            "orchestrator_id": {"type": "string"},
             "orchestrator_agent_thread_id": {"type": "string"},
             "description_md": {"type": "string"},
         },
-        "required": ["chat_thread_id", "description_md"],
+        "required": ["chat_thread_id", "orchestrator_id", "description_md"],
         "additionalProperties": False,
     },
 )
-def draft(args: dict[str, Any]) -> dict[str, Any]:
+def create_chat_proposal(args: dict[str, Any]) -> dict[str, Any]:
     init_app_db()
     thread_id = _string(args, "chat_thread_id")
-    orchestrator_agent_id = str(args.get("agent_id") or args.get("orchestrator_agent_id") or "manifest-orchestrator")
+    orchestrator_agent_id = str(args.get("orchestrator_id") or args.get("orchestrator_agent_id") or "manifest-orchestrator")
     description = _string(args, "description_md")
     with Session(engine) as session:
         _require_manifest_orchestrator(session, thread_id, orchestrator_agent_id)
-        _cancel_active_draft_gates(session, thread_id)
-        item = ChatDraft(
+        _cancel_active_chat_artifacts(session, thread_id)
+        item = ChatProposal(
             chat_thread_id=thread_id,
-            manifest_orchestrator_id=str(args.get("manifest_orchestrator_id") or ""),
+            orchestrator_id=orchestrator_agent_id,
             orchestrator_agent_thread_id=str(args.get("orchestrator_agent_thread_id") or "") or None,
             description_md=description,
             status="active",
@@ -545,12 +545,12 @@ def draft(args: dict[str, Any]) -> dict[str, Any]:
         session.add(item)
         session.commit()
         session.refresh(item)
-        return {"success": True, "draft": _draft_payload(item)}
+        return {"success": True, "proposal": _chat_proposal_payload(item)}
 
 
 @registry.tool(
-    "get_active_draft",
-    "Read the active Draft Mode draft and all Draft Mode questions for a chat.",
+    "get_active_chat_artifacts",
+    "Read the active proposal, plan draft, and question batch for a chat.",
     {
         "type": "object",
         "properties": {"chat_thread_id": {"type": "string"}},
@@ -558,35 +558,41 @@ def draft(args: dict[str, Any]) -> dict[str, Any]:
         "additionalProperties": False,
     },
 )
-def get_active_draft(args: dict[str, Any]) -> dict[str, Any]:
+def get_active_chat_artifacts(args: dict[str, Any]) -> dict[str, Any]:
     init_app_db()
     thread_id = _string(args, "chat_thread_id")
     with Session(engine) as session:
-        draft_item = session.exec(
-            select(ChatDraft)
-            .where(ChatDraft.chat_thread_id == thread_id, ChatDraft.status.in_(["active", "accepted"]))
-            .order_by(ChatDraft.updated_at.desc())
+        proposal = session.exec(
+            select(ChatProposal)
+            .where(ChatProposal.chat_thread_id == thread_id, ChatProposal.status == "active")
+            .order_by(ChatProposal.updated_at.desc())
+        ).first()
+        plan_draft = session.exec(
+            select(ChatPlanDraft)
+            .where(ChatPlanDraft.chat_thread_id == thread_id, ChatPlanDraft.status == "active")
+            .order_by(ChatPlanDraft.updated_at.desc())
         ).first()
         pending_question = session.exec(
-            select(ChatDraftQuestion)
-            .where(ChatDraftQuestion.chat_thread_id == thread_id, ChatDraftQuestion.status == "pending")
-            .order_by(ChatDraftQuestion.created_at.desc(), ChatDraftQuestion.position)
+            select(ChatQuestion)
+            .where(ChatQuestion.chat_thread_id == thread_id, ChatQuestion.status == "pending")
+            .order_by(ChatQuestion.created_at.desc(), ChatQuestion.position)
         ).first()
         questions = []
         if pending_question:
             questions = session.exec(
-                select(ChatDraftQuestion)
+                select(ChatQuestion)
                 .where(
-                    ChatDraftQuestion.chat_thread_id == thread_id,
-                    ChatDraftQuestion.batch_id == pending_question.batch_id,
-                    ChatDraftQuestion.status.in_(["pending", "answered"]),
+                    ChatQuestion.chat_thread_id == thread_id,
+                    ChatQuestion.batch_id == pending_question.batch_id,
+                    ChatQuestion.status.in_(["pending", "answered"]),
                 )
-                .order_by(ChatDraftQuestion.position, ChatDraftQuestion.created_at)
+                .order_by(ChatQuestion.position, ChatQuestion.created_at)
             ).all()
         return {
             "success": True,
-            "draft": _draft_payload(draft_item) if draft_item else None,
-            "questions": [_draft_question_payload(question) for question in questions],
+            "proposal": _chat_proposal_payload(proposal) if proposal else None,
+            "plan_draft": _chat_plan_draft_payload(plan_draft) if plan_draft else None,
+            "questions": [_chat_question_payload(question) for question in questions],
         }
 
 
@@ -668,7 +674,7 @@ def run_discussion(args: dict[str, Any]) -> dict[str, Any]:
     timeout_seconds = int(args.get("timeout_seconds") or 600)
     with Session(engine) as session:
         _require_manifest_orchestrator(session, thread_id, orchestrator_agent_id)
-        _require_no_blocking_draft_gate(session, thread_id)
+        _require_no_blocking_chat_artifact(session, thread_id)
     detail = start_discussion(args)
     if not wait:
         return detail
@@ -1141,18 +1147,16 @@ def delete_script(args: dict[str, Any]) -> dict[str, Any]:
 
 
 @registry.tool(
-    "create_plan_from_intake",
+    "create_in_chat_plan_draft",
     (
-        "Create a Vibe plan from a feature-intake chat. The manifest orchestrator owns this call. "
-        "Steps must be executable implementation, migration, wiring, test, review, or release work. "
-        "Clarifications, definitions, specs, architecture decisions, acceptance criteria, and open questions "
-        "belong in description/context_md, not as standalone steps."
+        "Create a persisted in-chat plan draft from a feature-intake chat. The manifest orchestrator owns this call. "
+        "This validates the full structured plan payload but does not create the real plan until the user accepts it."
     ),
     {
         "type": "object",
         "properties": {
             "chat_thread_id": {"type": "string"},
-            "agent_id": {"type": "string"},
+            "orchestrator_id": {"type": "string"},
             "name": {"type": "string"},
             "description": {
                 "type": "string",
@@ -1210,143 +1214,84 @@ def delete_script(args: dict[str, Any]) -> dict[str, Any]:
                 },
             },
         },
-        "required": ["chat_thread_id", "agent_id", "name", "description", "steps"],
+        "required": ["chat_thread_id", "orchestrator_id", "name", "description", "steps"],
         "additionalProperties": False,
     },
 )
-def create_plan_from_intake(args: dict[str, Any]) -> dict[str, Any]:
+def create_in_chat_plan_draft(args: dict[str, Any]) -> dict[str, Any]:
     init_app_db()
     thread_id = _string(args, "chat_thread_id")
-    agent_id = _string(args, "agent_id")
-    steps_payload = args.get("steps")
-    if not isinstance(steps_payload, list) or not steps_payload:
-        raise ToolError("steps must be a non-empty array", code="invalid_input")
+    orchestrator_id = _string(args, "orchestrator_id")
     with Session(engine) as session:
         try:
-            _require_manifest_orchestrator(session, thread_id, agent_id)
-            accepted_draft = _require_accepted_draft(session, thread_id)
-            plan = Plan(
+            _require_manifest_orchestrator(session, thread_id, orchestrator_id)
+            repositories, steps = validate_plan_draft_payload(
+                session,
+                repositories=args.get("repositories") or [],
+                steps=args.get("steps"),
+            )
+            _cancel_active_chat_artifacts(session, thread_id)
+            draft = ChatPlanDraft(
+                chat_thread_id=thread_id,
+                orchestrator_id=orchestrator_id,
                 name=_string(args, "name"),
                 description=_string(args, "description"),
                 context_md=str(args.get("context_md") or ""),
+                repositories_json=repositories,
+                steps_json=steps,
+                status="active",
             )
-            session.add(plan)
-            session.flush()
-            for item in args.get("repositories") or []:
-                if not isinstance(item, dict):
-                    continue
-                repository = session.get(
-                    GitRepository,
-                    _required_string(item, "repository_id"),
-                )
-                if not repository:
-                    raise ToolError("repository_id not found", code="not_found")
-                session.add(
-                    PlanRepository(
-                        plan_id=plan.id,
-                        repository_id=repository.id,
-                        start_ref=str(
-                            item.get("start_ref") or repository.default_branch
-                        ),
-                    )
-                )
-            plan_chat = ChatThread(thread_type="planChatOrchestrator", title=plan.name)
-            session.add(plan_chat)
-            session.flush()
-            session.add(PlanChatThread(plan_id=plan.id, chat_thread_id=plan_chat.id))
-
-            created_steps: list[Step] = []
-            for item in steps_payload:
-                if not isinstance(item, dict):
-                    raise ToolError("step items must be objects", code="invalid_input")
-                _reject_legacy_step_kind(item)
-                step_type = _required_step_type(session, item.get("step_type_id"))
-                _validate_create_plan_step_payload(item, step_type)
-                step = Step(
-                    plan_id=plan.id,
-                    step_type_id=step_type.id,
-                    name=_required_string(item, "name"),
-                    description=_required_string(item, "description"),
-                    kind=_legacy_kind_for_step_type(step_type),
-                    position=len(created_steps),
-                )
-                session.add(step)
-                session.flush()
-                created_steps.append(step)
-                for repository_id in item.get("repository_ids") or []:
-                    if isinstance(repository_id, str) and repository_id.strip():
-                        session.add(
-                            StepRepository(
-                                step_id=step.id,
-                                repository_id=repository_id,
-                            )
-                        )
-                script_id = str(item.get("script_id") or "")
-                if script_id:
-                    session.add(
-                        ScriptStep(
-                            step_id=step.id,
-                            script_id=script_id,
-                            args_text=str(item.get("script_args_text") or ""),
-                        )
-                    )
-                command_text = str(item.get("command_text") or "")
-                if command_text.strip():
-                    timeout = int(item.get("command_timeout_seconds") or 600)
-                    if timeout < 1:
-                        raise ToolError(
-                            "command_timeout_seconds must be at least 1",
-                            code="invalid_input",
-                        )
-                    session.add(
-                        CommandStep(
-                            step_id=step.id,
-                            command_text=command_text,
-                            timeout_seconds=timeout,
-                        )
-                    )
-                for assignment in item.get("assignments") or []:
-                    if isinstance(assignment, dict):
-                        session.add(
-                            StepAssignment(
-                                step_id=step.id,
-                                agent_id=_required_string(assignment, "agent_id"),
-                                instructions_md=_required_string(
-                                    assignment,
-                                    "instructions_md",
-                                ),
-                            )
-                        )
-                session.flush()
-                _validate_step_contract(session, step)
-
-            for index, item in enumerate(steps_payload):
-                if not isinstance(item, dict):
-                    continue
-                for dependency_index in item.get("depends_on_step_indexes") or []:
-                    if (
-                        isinstance(dependency_index, int)
-                        and 0 <= dependency_index < len(created_steps)
-                    ):
-                        session.add(
-                            StepDependency(
-                                step_id=created_steps[index].id,
-                                depends_on_step_id=created_steps[dependency_index].id,
-                            )
-                        )
-            accepted_draft.status = "implemented"
-            accepted_draft.updated_at = utcnow()
-            session.add(accepted_draft)
+            session.add(draft)
             session.commit()
+            session.refresh(draft)
+            return {
+                "success": True,
+                "plan_draft": _chat_plan_draft_payload(draft),
+            }
+        except PlanDraftError as error:
+            session.rollback()
+            raise ToolError(str(error), code=error.code) from error
+        except Exception:
+            session.rollback()
+            raise
+
+
+@registry.tool(
+    "accept_chat_plan_draft",
+    "Accept an active in-chat plan draft and atomically create the real Vibe plan.",
+    {
+        "type": "object",
+        "properties": {
+            "chat_plan_draft_id": {"type": "string"},
+            "orchestrator_id": {"type": "string"},
+        },
+        "required": ["chat_plan_draft_id", "orchestrator_id"],
+        "additionalProperties": False,
+    },
+)
+def accept_chat_plan_draft(args: dict[str, Any]) -> dict[str, Any]:
+    init_app_db()
+    draft_id = _string(args, "chat_plan_draft_id")
+    orchestrator_id = _string(args, "orchestrator_id")
+    with Session(engine) as session:
+        draft = session.get(ChatPlanDraft, draft_id)
+        if not draft:
+            raise ToolError("chat_plan_draft_id not found", code="not_found")
+        _require_manifest_orchestrator(session, draft.chat_thread_id, orchestrator_id)
+        try:
+            plan, plan_chat, steps = create_plan_from_chat_plan_draft(session, draft)
+            session.commit()
+            session.refresh(draft)
             return {
                 "success": True,
                 "plan_id": plan.id,
                 "chat_thread_id": plan_chat.id,
-                "step_ids": [step.id for step in created_steps],
+                "step_ids": [step.id for step in steps],
+                "plan_draft": _chat_plan_draft_payload(draft),
             }
-        except Exception:
+        except PlanDraftError as error:
             session.rollback()
-            raise
+            raise ToolError(str(error), code=error.code) from error
 
 
 @registry.tool(
@@ -2507,21 +2452,28 @@ def _require_manifest_orchestrator(session: Session, thread_id: str, agent_id: s
     if not session.get(ChatThread, thread_id):
         raise ToolError("chat_thread_id not found", code="not_found")
     if agent_id not in {"manifest-orchestrator", "freeChatOrchestrator", "featureIntakeOrchestrator", "planChatOrchestrator"}:
-        raise ToolError("Draft Mode and agent orchestration tools are restricted to the manifest orchestrator", code="forbidden")
+        raise ToolError("chat orchestration tools are restricted to the manifest orchestrator", code="forbidden")
 
 
-def _cancel_active_draft_gates(session: Session, thread_id: str) -> None:
-    active_drafts = session.exec(
-        select(ChatDraft).where(ChatDraft.chat_thread_id == thread_id, ChatDraft.status == "active")
+def _cancel_active_chat_artifacts(session: Session, thread_id: str) -> None:
+    active_proposals = session.exec(
+        select(ChatProposal).where(ChatProposal.chat_thread_id == thread_id, ChatProposal.status == "active")
+    ).all()
+    active_plan_drafts = session.exec(
+        select(ChatPlanDraft).where(ChatPlanDraft.chat_thread_id == thread_id, ChatPlanDraft.status == "active")
     ).all()
     pending_questions = session.exec(
-        select(ChatDraftQuestion).where(
-            ChatDraftQuestion.chat_thread_id == thread_id,
-            ChatDraftQuestion.status == "pending",
+        select(ChatQuestion).where(
+            ChatQuestion.chat_thread_id == thread_id,
+            ChatQuestion.status == "pending",
         )
     ).all()
     now = utcnow()
-    for item in active_drafts:
+    for item in active_proposals:
+        item.status = "canceled"
+        item.updated_at = now
+        session.add(item)
+    for item in active_plan_drafts:
         item.status = "canceled"
         item.updated_at = now
         session.add(item)
@@ -2531,44 +2483,25 @@ def _cancel_active_draft_gates(session: Session, thread_id: str) -> None:
         session.add(item)
 
 
-def _require_no_blocking_draft_gate(session: Session, thread_id: str) -> None:
-    active_draft = session.exec(
-        select(ChatDraft).where(ChatDraft.chat_thread_id == thread_id, ChatDraft.status == "active")
+def _require_no_blocking_chat_artifact(session: Session, thread_id: str) -> None:
+    active_proposal = session.exec(
+        select(ChatProposal).where(ChatProposal.chat_thread_id == thread_id, ChatProposal.status == "active")
     ).first()
-    if active_draft:
-        raise ToolError("active draft must be answered before continuing", code="draft_gate_active")
+    if active_proposal:
+        raise ToolError("active proposal must be answered before continuing", code="chat_artifact_active")
+    active_plan_draft = session.exec(
+        select(ChatPlanDraft).where(ChatPlanDraft.chat_thread_id == thread_id, ChatPlanDraft.status == "active")
+    ).first()
+    if active_plan_draft:
+        raise ToolError("active plan draft must be answered before continuing", code="chat_artifact_active")
     pending_question = session.exec(
-        select(ChatDraftQuestion).where(
-            ChatDraftQuestion.chat_thread_id == thread_id,
-            ChatDraftQuestion.status == "pending",
+        select(ChatQuestion).where(
+            ChatQuestion.chat_thread_id == thread_id,
+            ChatQuestion.status == "pending",
         )
     ).first()
     if pending_question:
-        raise ToolError("pending questions must be answered before continuing", code="draft_gate_active")
-
-
-def _require_accepted_draft(session: Session, thread_id: str) -> ChatDraft:
-    pending_question = session.exec(
-        select(ChatDraftQuestion).where(
-            ChatDraftQuestion.chat_thread_id == thread_id,
-            ChatDraftQuestion.status == "pending",
-        )
-    ).first()
-    if pending_question:
-        raise ToolError("pending questions must be answered before creating a plan", code="draft_gate_active")
-    active_draft = session.exec(
-        select(ChatDraft).where(ChatDraft.chat_thread_id == thread_id, ChatDraft.status == "active")
-    ).first()
-    if active_draft:
-        raise ToolError("active draft must be accepted before creating a plan", code="draft_not_accepted")
-    accepted_draft = session.exec(
-        select(ChatDraft)
-        .where(ChatDraft.chat_thread_id == thread_id, ChatDraft.status == "accepted")
-        .order_by(ChatDraft.updated_at.desc())
-    ).first()
-    if not accepted_draft:
-        raise ToolError("accepted draft required before creating a plan", code="draft_not_accepted")
-    return accepted_draft
+        raise ToolError("pending questions must be answered before continuing", code="chat_artifact_active")
 
 
 def _require_plan_orchestrator(session: Session, plan: Plan, agent_id: str) -> None:
@@ -2620,11 +2553,11 @@ def _last_assistant_message(thread: dict[str, Any]) -> str:
     return ""
 
 
-def _draft_payload(item: ChatDraft) -> dict[str, Any]:
+def _chat_proposal_payload(item: ChatProposal) -> dict[str, Any]:
     return {
         "id": item.id,
         "chat_thread_id": item.chat_thread_id,
-        "manifest_orchestrator_id": item.manifest_orchestrator_id,
+        "orchestrator_id": item.orchestrator_id,
         "orchestrator_agent_thread_id": item.orchestrator_agent_thread_id,
         "description_md": item.description_md,
         "status": item.status,
@@ -2633,11 +2566,27 @@ def _draft_payload(item: ChatDraft) -> dict[str, Any]:
     }
 
 
-def _draft_question_payload(item: ChatDraftQuestion) -> dict[str, Any]:
+def _chat_plan_draft_payload(item: ChatPlanDraft) -> dict[str, Any]:
     return {
         "id": item.id,
         "chat_thread_id": item.chat_thread_id,
-        "chat_draft_id": item.chat_draft_id,
+        "orchestrator_id": item.orchestrator_id,
+        "name": item.name,
+        "description": item.description,
+        "context_md": item.context_md,
+        "repositories_json": item.repositories_json,
+        "steps_json": item.steps_json,
+        "status": item.status,
+        "created_plan_id": item.created_plan_id,
+        "created_at": item.created_at.isoformat(),
+        "updated_at": item.updated_at.isoformat(),
+    }
+
+
+def _chat_question_payload(item: ChatQuestion) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "chat_thread_id": item.chat_thread_id,
         "question": item.question,
         "options_json": item.options_json,
         "selected_option": item.selected_option,

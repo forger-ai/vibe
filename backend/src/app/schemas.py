@@ -201,28 +201,24 @@ class ChatProgressEventCreate(BaseModel):
     content_md: str = ""
 
 
-class ChatDraftCreate(BaseModel):
-    chat_thread_id: str
-    manifest_orchestrator_id: str = ""
-    orchestrator_agent_thread_id: str | None = None
-    description_md: str
-
-
-class ChatDraftUpdate(BaseModel):
+class ChatProposalUpdate(BaseModel):
     status: str | None = None
     description_md: str | None = None
 
 
-class ChatDraftQuestionCreate(BaseModel):
+class ChatPlanDraftUpdate(BaseModel):
+    status: str | None = None
+
+
+class ChatQuestionCreate(BaseModel):
     chat_thread_id: str
-    chat_draft_id: str | None = None
     question: str
     options_json: list[dict[str, Any]] = Field(default_factory=list)
     batch_id: str
     position: int = 0
 
 
-class ChatDraftQuestionAnswer(BaseModel):
+class ChatQuestionAnswer(BaseModel):
     selected_option: str | None = None
     answer_text: str = ""
 

@@ -267,10 +267,10 @@ export type ChatProgressEvent = {
   created_at: string;
 };
 
-export type ChatDraft = {
+export type ChatProposal = {
   id: string;
   chat_thread_id: string;
-  manifest_orchestrator_id: string;
+  orchestrator_id: string;
   orchestrator_agent_thread_id?: string | null;
   description_md: string;
   status: string;
@@ -278,10 +278,24 @@ export type ChatDraft = {
   updated_at: string;
 };
 
-export type ChatDraftQuestion = {
+export type ChatPlanDraft = {
   id: string;
   chat_thread_id: string;
-  chat_draft_id?: string | null;
+  orchestrator_id: string;
+  name: string;
+  description: string;
+  context_md: string;
+  repositories_json: Array<{ repository_id: string; start_ref?: string }>;
+  steps_json: Array<Record<string, unknown>>;
+  status: string;
+  created_plan_id?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ChatQuestion = {
+  id: string;
+  chat_thread_id: string;
   question: string;
   options_json: Array<{ label: string; description?: string }>;
   selected_option?: string | null;
@@ -293,9 +307,10 @@ export type ChatDraftQuestion = {
   updated_at: string;
 };
 
-export type ChatDraftState = {
-  draft?: ChatDraft | null;
-  questions: ChatDraftQuestion[];
+export type ChatArtifactState = {
+  proposal?: ChatProposal | null;
+  plan_draft?: ChatPlanDraft | null;
+  questions: ChatQuestion[];
 };
 
 export type NotebookEntry = {

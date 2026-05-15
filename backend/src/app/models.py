@@ -86,10 +86,10 @@ class ChatProgressEvent(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
 
 
-class ChatDraft(SQLModel, table=True):
+class ChatProposal(SQLModel, table=True):
     id: str = Field(default_factory=new_id, primary_key=True)
     chat_thread_id: str = Field(foreign_key="chatthread.id", index=True)
-    manifest_orchestrator_id: str = Field(default="", index=True, max_length=160)
+    orchestrator_id: str = Field(default="", index=True, max_length=160)
     orchestrator_agent_thread_id: str | None = Field(default=None, foreign_key="agentthread.id", index=True)
     description_md: str = Field(default="", max_length=100000)
     status: str = Field(default="active", index=True, max_length=80)
@@ -97,10 +97,24 @@ class ChatDraft(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
-class ChatDraftQuestion(SQLModel, table=True):
+class ChatPlanDraft(SQLModel, table=True):
     id: str = Field(default_factory=new_id, primary_key=True)
     chat_thread_id: str = Field(foreign_key="chatthread.id", index=True)
-    chat_draft_id: str | None = Field(default=None, foreign_key="chatdraft.id", index=True)
+    orchestrator_id: str = Field(default="", index=True, max_length=160)
+    name: str = Field(index=True, min_length=1, max_length=160)
+    description: str = Field(default="", max_length=20000)
+    context_md: str = Field(default="", max_length=40000)
+    repositories_json: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+    steps_json: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
+    status: str = Field(default="active", index=True, max_length=80)
+    created_plan_id: str | None = Field(default=None, foreign_key="plan.id", index=True)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class ChatQuestion(SQLModel, table=True):
+    id: str = Field(default_factory=new_id, primary_key=True)
+    chat_thread_id: str = Field(foreign_key="chatthread.id", index=True)
     question: str = Field(default="", max_length=2000)
     options_json: list[dict] = Field(default_factory=list, sa_column=Column(JSON))
     selected_option: str | None = Field(default=None, max_length=500)

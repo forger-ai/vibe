@@ -4,11 +4,12 @@ import type {
   AgentRun,
   AgentThread,
   ChatAgentThread,
-  ChatDraft,
-  ChatDraftQuestion,
-  ChatDraftState,
+  ChatArtifactState,
   ChatMessage,
+  ChatPlanDraft,
   ChatProgressEvent,
+  ChatProposal,
+  ChatQuestion,
   ChatThread,
   DashboardSummary,
   Discussion,
@@ -114,10 +115,13 @@ export const api = {
     event_type: string;
     content_md: string;
   }) => post<ChatProgressEvent>("/api/chat/progress", body),
-  activeDraft: (threadId: string) => get<ChatDraftState>(`/api/chat/drafts/active/${threadId}`),
-  updateDraft: (id: string, body: Partial<ChatDraft>) => patch<ChatDraft>(`/api/chat/drafts/${id}`, body),
-  answerDraftQuestion: (id: string, body: { selected_option?: string | null; answer_text?: string }) =>
-    patch<ChatDraftQuestion>(`/api/chat/drafts/questions/${id}`, body),
+  activeChatArtifacts: (threadId: string) => get<ChatArtifactState>(`/api/chat/proposals/active/${threadId}`),
+  updateChatProposal: (id: string, body: Partial<ChatProposal>) => patch<ChatProposal>(`/api/chat/proposals/${id}`, body),
+  updateChatPlanDraft: (id: string, body: Partial<ChatPlanDraft>) => patch<ChatPlanDraft>(`/api/chat/proposals/plan-drafts/${id}`, body),
+  acceptChatPlanDraft: (id: string) =>
+    post<{ success: boolean; plan: Plan; chat_thread: ChatThread; step_ids: string[]; plan_draft: ChatPlanDraft }>(`/api/chat/proposals/plan-drafts/${id}/accept`, {}),
+  answerChatQuestion: (id: string, body: { selected_option?: string | null; answer_text?: string }) =>
+    patch<ChatQuestion>(`/api/chat/proposals/questions/${id}`, body),
   createChatDebugEvent: (body: {
     chat_thread_id?: string | null;
     event_type: string;

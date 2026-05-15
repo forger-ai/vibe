@@ -8,7 +8,7 @@ from app.cors import allowed_origins
 from app.database_ext import init_app_db
 from app.health import router as health_router
 from app.realtime import create_realtime_router
-from app.routes import agent_threads, agents, chat, dashboard, discussions, drafts, notebooks, plans, repositories, scripts, step_types
+from app.routes import agent_threads, agents, chat, dashboard, discussions, notebooks, plans, proposals, repositories, scripts, step_types
 from app.services.agent_runtime import start_desktop_event_listener
 
 
@@ -52,7 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(scripts.router)
     app.include_router(plans.router)
     app.include_router(chat.router)
-    app.include_router(drafts.router)
+    app.include_router(proposals.router)
     app.include_router(discussions.router)
     app.include_router(notebooks.router)
     app.include_router(agent_threads.router)

@@ -87,6 +87,13 @@ export default function App() {
     setViewMode("plans");
   }
 
+  function handlePlanCreated(plan: Plan) {
+    setPlans((current) => current.some((item) => item.id === plan.id) ? current : [plan, ...current]);
+    setSelectedPlan(plan);
+    setViewMode("plans");
+    void load();
+  }
+
   function changeView(nextView: ViewMode) {
     if (nextView === "plans") {
       setSelectedPlan(null);
@@ -117,6 +124,7 @@ export default function App() {
             manifestAgentId="featureIntakeOrchestrator"
             agents={agents}
             onChanged={() => void load()}
+            onPlanCreated={handlePlanCreated}
           />
         )}
         {viewMode === "free-chat" && (

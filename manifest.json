@@ -77,7 +77,7 @@
       "tag_template": "{name}/v{version}",
       "asset_name_template": "{name}-{version}.zip"
     },
-    "beta": true
+    "status": "coming"
   },
   "agents": [
     {
